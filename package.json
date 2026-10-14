@@ -1,0 +1,27 @@
+{
+  "name": "thermo",
+  "private": true,
+  "description": "Open-source printing platform for MXW01 Bluetooth thermal \"cat\" printers",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "npm run dev -w @thermo/web",
+    "build": "npm run build -w @thermo/web",
+    "preview": "npm run preview -w @thermo/web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p packages/mxw01 && tsc -p packages/render && tsc -p apps/web"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}

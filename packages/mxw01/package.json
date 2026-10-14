@@ -1,0 +1,17 @@
+{
+  "name": "@thermo/mxw01",
+  "version": "0.1.0",
+  "description": "Driver for MXW01 Bluetooth LE thermal \"cat\" printers (Web Bluetooth and pluggable transports)",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "devDependencies": {
+    "@types/web-bluetooth": "^0.0.21"
+  }
+}
