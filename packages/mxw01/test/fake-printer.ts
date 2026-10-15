@@ -18,6 +18,10 @@ export interface FakePrinterOptions {
   busyPolls?: number;
   /** Report "out of paper" to status requests once this many data writes have arrived. */
   failAfterWrites?: number;
+  /** Report "printing" once this many data writes have arrived, like the real printer starting early. */
+  printingAfterWrites?: number;
+  /** Announce the print is done (AA) this long after the end-of-data command. */
+  doneAfterMs?: number;
 }
 
 /** In-memory MXW01 that answers like the real printer. */
@@ -55,6 +59,8 @@ export class FakePrinter implements Transport {
       case Command.GetStatus:
         if (this.options.failAfterWrites !== undefined && this.data.length >= this.options.failAfterWrites) {
           this.reply(Command.GetStatus, [1, 0, 0, 90, 30, 0, 1, 1]);
+        } else if (this.options.printingAfterWrites !== undefined && this.data.length >= this.options.printingAfterWrites) {
+          this.reply(Command.GetStatus, [1, ...status.slice(1)]);
         } else if (this.busyPollsLeft > 0) {
           this.busyPollsLeft--;
           this.reply(Command.GetStatus, [1, ...status.slice(1)]);
@@ -70,6 +76,9 @@ export class FakePrinter implements Transport {
         break;
       case Command.PrintDataFlush:
         this.busyPollsLeft = this.options.busyPolls ?? 0;
+        if (this.options.doneAfterMs !== undefined) {
+          setTimeout(() => this.reply(Command.PrintComplete, [0x00, 0x66, 0x66]), this.options.doneAfterMs);
+        }
         if (this.options.quietFlush) break;
         this.reply(Command.GetStatus, this.options.statusWhilePrinting ?? [1, ...status.slice(1)]);
         setTimeout(() => {

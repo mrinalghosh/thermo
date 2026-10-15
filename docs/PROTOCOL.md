@@ -74,10 +74,26 @@ packet, not the payload.
    produced sheared, garbled output, because lost bytes shift every following row
 6. `AD`
 7. Wait until the printer is done. Disconnecting earlier truncates the print. Firmware
-   1.9.3.1.2 sends nothing on its own after `AD`: in one 280-line print the last byte went
-   at 5.1 s and the paper stopped at about 11 s, so waiting for 3 s of silence ends too
-   early. Instead, ask for `A1` every ~0.5 s until it has reported printing and then
-   standby, falling back to 3 s without a reply
+   1.9.3.1.2 sends no status on its own, so waiting for 3 s of silence ends too early. Ask
+   for `A1` every ~0.5 s instead. It answers printing, then feeding (its own end-of-job
+   feed, about 0.7 s), then sends `AA` (payload `00 66 66`) unprompted and reports standby.
+   Treat either `AA` or standby-after-printing as done, and fall back to ~3 s without a
+   reply
+
+Timeline of a 280-line 1bpp job at intensity `0x5D` on firmware 1.9.3.1.2, sending one
+row every 16.7 ms (60 lines/s):
+
+| Time     | Event                                                                   |
+| -------- | ----------------------------------------------------------------------- |
+| +0.45 s  | `A9` accepted                                                           |
+| ~+2 s    | Starts printing, with 61–124 lines received (status polled each second) |
+| +5.12 s  | Last byte sent                                                          |
+| +9.72 s  | Feeding                                                                 |
+| +10.44 s | `AA 00 66 66`                                                           |
+| +10.47 s | Standby                                                                 |
+
+That's 34–39 lines/s (4–5 mm/s) of printing, slower than the data arrives. So once the
+printer starts, the transfer isn't what limits it.
 
 Jobs shorter than 90 lines are padded to 90. Shorter jobs were reported to misbehave,
 though this is unconfirmed.
@@ -126,9 +142,9 @@ Above about 60 °C the app lowers intensity sharply, and more for dense images. 
 - Which way up does a strip read? jeremy46231's tool rotates jobs 180° by default and
   MaikelChan's doesn't. The web app has a toggle.
 - Is the 90-line minimum real?
-- Does the printer wait for the whole job before it starts? Rough stopwatch timings on
-  firmware 1.9.3.1.2 suggest so, which would make the transfer time a fixed delay before
-  every print.
+- What makes the printer start: an amount of buffered data, or a fixed delay? If it's
+  data, sending the first rows faster would start every print sooner.
+- Does darkness change print speed? Longer heating per line could slow the motor.
 - How fast can raster data go? `AE03` offers write-without-response only, and Chrome on
   macOS returns from each write in under a millisecond, so nothing slows the sender down.
   One 48-byte row every ~16.7 ms (2.9 kB/s) prints cleanly. Two rows every ~9 ms lost whole

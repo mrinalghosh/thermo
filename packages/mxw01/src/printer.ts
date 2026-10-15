@@ -95,8 +95,11 @@ const COMPLETION_QUIET_MS = 3000;
 /** Stop waiting if the printer still hasn't reported printing this long after the data. */
 const COMPLETION_START_MS = 5000;
 const STATUS_REPLY_TIMEOUT_MS = 1000;
-/** How often to measure a status round trip during the transfer. */
-const PROBE_INTERVAL_MS = 1000;
+/**
+ * How often to ask for status during the transfer: often until the printer starts (to see
+ * how much data it waits for), then about once a second to measure round trips.
+ */
+const PROBE_INTERVAL_MS = { beforeStart: 250, printing: 1000 };
 const FLOW_RESUME_TIMEOUT_MS = 30_000;
 
 export class MXW01Printer {
@@ -117,6 +120,9 @@ export class MXW01Printer {
   // Timing for the activity log, so slow prints can be traced to a phase.
   private jobStartedAt = 0;
   private jobState: PrinterStatus["state"] | null = null;
+  private jobLines = { sent: 0, total: 0 };
+  /** Set once all data is sent; `done` once the printer then says it has finished (AA). */
+  private jobEnd: { done: boolean } | null = null;
   private pausedAt: number | null = null;
 
   constructor(
@@ -160,7 +166,7 @@ export class MXW01Printer {
     if (this.transport.details) this.log(this.transport.details);
     // The vendor app waits briefly, then asks for the firmware version.
     await sleep(200);
-    await this.request(commands.getVersion(), Command.GetVersion, 1000, false);
+    await this.request(commands.getVersion(), [Command.GetVersion], 1000, false);
     await this.getStatus().catch((error) => this.log(`Status unavailable: ${error.message}`));
   }
 
@@ -171,7 +177,7 @@ export class MXW01Printer {
   }
 
   async getStatus(): Promise<PrinterStatus> {
-    const packet = await this.request(commands.getStatus(), Command.GetStatus, this.responseTimeoutMs);
+    const packet = await this.request(commands.getStatus(), [Command.GetStatus], this.responseTimeoutMs);
     const status = packet && parseStatus(packet.payload);
     if (!status) throw new PrinterError("Malformed status response", "timeout");
     return status;
@@ -196,6 +202,8 @@ export class MXW01Printer {
     this.busy = true;
     this.jobStartedAt = performance.now();
     this.jobState = null;
+    this.jobLines = { sent: 0, total: 0 };
+    this.jobEnd = null;
     try {
       await this.runJob(job, options);
     } finally {
@@ -240,7 +248,7 @@ export class MXW01Printer {
       `Printing ${lines} lines (${mode}, intensity 0x${intensity.toString(16)}) · ` +
         `${data.length} B as ${chunkSize} B writes every ${chunkDelayMs} ms`,
     );
-    const ack = await this.request(commands.printRequest(lines, mode), Command.Print, this.responseTimeoutMs);
+    const ack = await this.request(commands.printRequest(lines, mode), [Command.Print], this.responseTimeoutMs);
     // Some firmwares acknowledge with a bare `22 21 A9 00 00 00`, i.e. no status byte.
     if (!ack || (ack.payload[0] ?? 0x00) !== 0x00) {
       throw new PrinterError(`Printer rejected the job (${ack ? toHex(ack.payload) : "no reply"})`, "rejected");
@@ -252,7 +260,8 @@ export class MXW01Printer {
     let writeMs = 0;
     let slowestWriteMs = 0;
     let probe: Promise<void> | null = null;
-    let nextProbeAt = sendStartedAt + PROBE_INTERVAL_MS;
+    let nextProbeAt = sendStartedAt + PROBE_INTERVAL_MS.beforeStart;
+    this.jobLines = { sent: 0, total: lines };
     for (let offset = 0; offset < data.length; offset += chunkSize) {
       if (this.paused) await this.waitForResume(options.signal);
       if (options.signal?.aborted) throw await this.cancelJob();
@@ -268,11 +277,14 @@ export class MXW01Printer {
       writes++;
       writeMs += took;
       slowestWriteMs = Math.max(slowestWriteMs, took);
-      options.onProgress?.(Math.min(offset + chunkSize, data.length), data.length);
+      const sent = Math.min(offset + chunkSize, data.length);
+      this.jobLines.sent = Math.floor(sent / bytesPerLine);
+      options.onProgress?.(sent, data.length);
       if (!probe && performance.now() >= nextProbeAt) {
         probe = this.probeStatus().finally(() => {
           probe = null;
-          nextProbeAt = performance.now() + PROBE_INTERVAL_MS;
+          const started = this.jobState !== null && this.jobState !== "standby";
+          nextProbeAt = performance.now() + PROBE_INTERVAL_MS[started ? "printing" : "beforeStart"];
         });
       }
       if (chunkDelayMs) await sleep(chunkDelayMs);
@@ -284,6 +296,7 @@ export class MXW01Printer {
         `write calls took ${(writeMs / writes).toFixed(1)} ms avg, ${slowestWriteMs.toFixed(1)} ms max)`,
     );
     await this.transport.writeControl(commands.flush());
+    this.jobEnd = { done: false };
     const how = await this.waitForCompletion(lines, options.signal);
     this.log(`${this.elapsed()} Print finished (${how})`);
   }
@@ -300,8 +313,15 @@ export class MXW01Printer {
     let started = false;
     while (Date.now() < deadline) {
       if (signal?.aborted) throw await this.cancelJob();
-      const packet = await this.request(commands.getStatus(), Command.GetStatus, STATUS_REPLY_TIMEOUT_MS, false);
+      if (this.jobEnd?.done) return "printer reported done";
+      const packet = await this.request(
+        commands.getStatus(),
+        [Command.GetStatus, Command.PrintComplete],
+        STATUS_REPLY_TIMEOUT_MS,
+        false,
+      );
       if (signal?.aborted) throw await this.cancelJob();
+      if (this.jobEnd?.done) return "printer reported done";
       const status = packet && parseStatus(packet.payload);
       const now = performance.now();
       if (status) {
@@ -331,7 +351,7 @@ export class MXW01Printer {
   private async probeStatus() {
     const sentAt = performance.now();
     try {
-      const packet = await this.request(commands.getStatus(), Command.GetStatus, STATUS_REPLY_TIMEOUT_MS, false);
+      const packet = await this.request(commands.getStatus(), [Command.GetStatus], STATUS_REPLY_TIMEOUT_MS, false);
       if (!this.busy) return; // the job ended (cancelled or failed) while waiting
       const status = packet && parseStatus(packet.payload);
       this.log(
@@ -367,8 +387,8 @@ export class MXW01Printer {
   }
 
   /** Sends a control packet and waits for the reply, listening before sending so a fast reply isn't missed. */
-  private async request(packet: Uint8Array, reply: number, timeoutMs: number, required = true) {
-    const replied = this.waitFor([reply], timeoutMs, required);
+  private async request(packet: Uint8Array, replies: number[], timeoutMs: number, required = true) {
+    const replied = this.waitFor(replies, timeoutMs, required);
     try {
       await this.transport.writeControl(packet);
     } catch (error) {
@@ -433,7 +453,9 @@ export class MXW01Printer {
           if (this.busy) {
             // The first frame of a job is the pre-print check; log changes after that.
             if (this.jobState !== null && status.state !== this.jobState) {
-              this.log(`${this.elapsed()} Printer state: ${status.state}`);
+              const { sent, total } = this.jobLines;
+              const progress = sent < total ? ` (${sent} of ${total} lines sent)` : "";
+              this.log(`${this.elapsed()} Printer state: ${status.state}${progress}`);
             }
             this.jobState = status.state;
           }
@@ -449,6 +471,10 @@ export class MXW01Printer {
         }
         break;
       }
+      case Command.PrintComplete:
+        // Firmware 1.9.3.1.2 sends AA on its own once the print and its paper feed are done.
+        if (this.busy && this.jobEnd) this.jobEnd.done = true;
+        break;
       case Command.SignChallenge:
         void this.answerSignChallenge(payload);
         break;

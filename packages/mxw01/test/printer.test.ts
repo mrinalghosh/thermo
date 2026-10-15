@@ -121,6 +121,27 @@ describe("MXW01Printer", () => {
     expect(logs.at(-1)).toMatch(/Print finished \(printer reported standby\)$/);
   });
 
+  it("finishes when the printer announces it's done, even between status requests", async () => {
+    // Still answering "printing" when asked; only the unprompted AA says it's over.
+    const fake = new FakePrinter({ quietFlush: true, busyPolls: 1000, doneAfterMs: 30 });
+    const printer = new MXW01Printer(fake, { ...options, statusPollMs: 100 });
+    await printer.connect();
+    const logs: string[] = [];
+    printer.on("log", (message) => logs.push(message));
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 90) });
+    expect(logs.at(-1)).toMatch(/Print finished \(printer reported done\)$/);
+  });
+
+  it("logs how much data the printer had when it started", async () => {
+    const fake = new FakePrinter({ printingAfterWrites: 40 });
+    const printer = await connected(fake);
+    const logs: string[] = [];
+    printer.on("log", (message) => logs.push(message));
+    // About 1.5 s of transfer, so the 250 ms probes see the printer start.
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) }, { chunkDelayMs: 15 });
+    expect(logs).toContainEqual(expect.stringMatching(/Printer state: printing \([4-6]\d of 100 lines sent\)$/));
+  });
+
   it("cancels promptly while waiting for the printer to finish", async () => {
     const fake = new FakePrinter({ quietFlush: true, busyPolls: 1000 });
     const printer = new MXW01Printer(fake, { ...options, statusPollMs: 50 });
@@ -172,7 +193,8 @@ describe("MXW01Printer", () => {
     expect(logs).toContainEqual(expect.stringMatching(stamped(String.raw`Flow control: resume after \d+\.\d\d s$`)));
     expect(logs).toContainEqual(expect.stringMatching(stamped(String.raw`Sent 4320 B in .*a write every .* ms; write calls took`)));
     expect(logs).toContainEqual(expect.stringMatching(stamped("Printer state: printing$")));
-    expect(logs.at(-1)).toMatch(stamped(String.raw`Print finished \(printer reported standby\)$`));
+    // This fake announces the end with AA, as firmware 1.9.3.1.2 does.
+    expect(logs.at(-1)).toMatch(stamped(String.raw`Print finished \(printer reported done\)$`));
   });
 
   it("applies per-print transfer pacing", async () => {
