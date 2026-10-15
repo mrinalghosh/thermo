@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { DEFAULT_SETTINGS, type Settings } from "../settings.js";
 import type { LogEntry, usePrinter } from "../usePrinter.js";
 import type { DrawerKind } from "./HeaderBar.js";
@@ -20,9 +21,12 @@ export function Drawer({
     <aside className="panel" role="dialog" aria-label={kind}>
       <div className="phead">
         <span>{kind === "log" ? "activity log" : "settings"}</span>
-        <button className="pclose" onClick={onClose} title="close">
-          ✕
-        </button>
+        <span className="pactions">
+          {kind === "log" && printer.logs.length > 0 && <CopyLog logs={printer.logs} />}
+          <button className="pclose" onClick={onClose} title="close">
+            ✕
+          </button>
+        </span>
       </div>
       {kind === "log" ? (
         <LogList logs={printer.logs} />
@@ -78,6 +82,43 @@ function SettingsBody({
         reset to defaults
       </button>
     </div>
+  );
+}
+
+/** Copies the log oldest-first with millisecond times, for pasting into a bug report. */
+function CopyLog({ logs }: { logs: LogEntry[] }) {
+  const [label, setLabel] = useState<"copy" | "copied" | "copy failed">("copy");
+  useEffect(() => {
+    if (label === "copy") return;
+    const timer = setTimeout(() => setLabel("copy"), 1500);
+    return () => clearTimeout(timer);
+  }, [label]);
+
+  const copy = async () => {
+    const text = logs
+      .map((entry) => {
+        // Naming any time field drops the defaults, so all of them are spelled out.
+        const time = entry.time.toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          fractionalSecondDigits: 3,
+          hour12: false,
+        });
+        return `${time}  ${entry.error ? "! " : ""}${entry.message}`;
+      })
+      .join("\n");
+    await navigator.clipboard.writeText(text);
+  };
+
+  return (
+    <button
+      className="pclose"
+      onClick={() => copy().then(() => setLabel("copied"), () => setLabel("copy failed"))}
+      title="copy the log to the clipboard"
+    >
+      {label}
+    </button>
   );
 }
 

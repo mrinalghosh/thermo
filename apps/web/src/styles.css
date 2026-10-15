@@ -678,6 +678,11 @@ textarea {
   text-transform: uppercase;
   color: rgba(20, 20, 20, 0.6);
 }
+.pactions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .pclose {
   background: transparent;
   border: none;

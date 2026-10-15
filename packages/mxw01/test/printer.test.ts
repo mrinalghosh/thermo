@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Command, MXW01Printer, PrinterError } from "../src/index.js";
 import { FakePrinter } from "./fake-printer.js";
 
-const options = { chunkDelayMs: 0, responseTimeoutMs: 200 };
+const options = { chunkDelayMs: 0, responseTimeoutMs: 200, statusPollMs: 5 };
 
 async function connected(fake: FakePrinter) {
   const printer = new MXW01Printer(fake, options);
@@ -27,7 +27,7 @@ describe("MXW01Printer", () => {
       { darkness: 3, onProgress: (sent) => progress.push(sent) },
     );
 
-    expect(fake.sentCommands).toEqual([
+    expect(fake.sentCommands.slice(0, 6)).toEqual([
       Command.GetVersion,
       Command.GetStatus,
       Command.GetStatus,
@@ -35,6 +35,8 @@ describe("MXW01Printer", () => {
       Command.Print,
       Command.PrintDataFlush,
     ]);
+    // Then status requests until the printer is done.
+    expect(fake.sentCommands.slice(6).every((command) => command === Command.GetStatus)).toBe(true);
     expect(fake.sentBytes).toBe(48 * 200);
     // One row per write: a lost or truncated write can't shift later rows.
     expect(fake.data.every((chunk) => chunk.length === 48)).toBe(true);
@@ -80,7 +82,7 @@ describe("MXW01Printer", () => {
     const fake = new FakePrinter({ printAck: [] });
     const printer = await connected(fake);
     await printer.print({ mode: "1bpp", data: new Uint8Array(48) });
-    expect(fake.sentCommands.at(-1)).toBe(Command.PrintDataFlush);
+    expect(fake.sentCommands).toContain(Command.PrintDataFlush);
   });
 
   it("reports running out of paper mid-print", async () => {
@@ -103,6 +105,74 @@ describe("MXW01Printer", () => {
     await result;
     expect(sentWhenResumed).toEqual([48 * 3]);
     expect(fake.sentBytes).toBe(48 * 100);
+  });
+
+  it("asks for status until the printer has printed and returned to standby", async () => {
+    // Like the real MXW01: silent after the data, "printing" while asked, then standby.
+    const fake = new FakePrinter({ quietFlush: true, busyPolls: 3 });
+    const printer = await connected(fake);
+    const logs: string[] = [];
+    printer.on("log", (message) => logs.push(message));
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 90) });
+
+    const afterData = fake.sentCommands.slice(fake.sentCommands.indexOf(Command.PrintDataFlush) + 1);
+    expect(afterData).toEqual(Array(4).fill(Command.GetStatus));
+    expect(logs).toContainEqual(expect.stringMatching(/Printer state: printing$/));
+    expect(logs.at(-1)).toMatch(/Print finished \(printer reported standby\)$/);
+  });
+
+  it("cancels promptly while waiting for the printer to finish", async () => {
+    const fake = new FakePrinter({ quietFlush: true, busyPolls: 1000 });
+    const printer = new MXW01Printer(fake, { ...options, statusPollMs: 50 });
+    await printer.connect();
+    const controller = new AbortController();
+    const result = printer.print({ mode: "1bpp", data: new Uint8Array(48 * 90) }, { signal: controller.signal });
+    await vi.waitFor(() => expect(fake.sentCommands).toContain(Command.PrintDataFlush));
+
+    const abortedAt = performance.now();
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ reason: "aborted" });
+    expect(performance.now() - abortedAt).toBeLessThan(40);
+    expect(fake.sentCommands.at(-1)).toBe(Command.CancelPrint);
+    expect(printer.printing).toBe(false);
+  });
+
+  it("stops sending when a status reply mid-transfer reports a problem", async () => {
+    const fake = new FakePrinter({ failAfterWrites: 5 });
+    const printer = await connected(fake);
+    // About 1.5 s of transfer: long enough for a status probe to see the problem.
+    const job = printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) }, { chunkDelayMs: 15 });
+    await expect(job).rejects.toMatchObject({ reason: "no-paper" });
+    expect(fake.sentBytes).toBeLessThan(48 * 100);
+    expect(fake.sentCommands.at(-1)).toBe(Command.CancelPrint);
+  });
+
+  it("measures status round trips during long transfers", async () => {
+    const fake = new FakePrinter();
+    const printer = await connected(fake);
+    const logs: string[] = [];
+    printer.on("log", (message) => logs.push(message));
+    // About 1.5 s of transfer: long enough for one probe.
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) }, { chunkDelayMs: 15 });
+
+    expect(logs).toContainEqual(expect.stringMatching(/^\+\d+\.\d\d s Status reply in \d+ ms \(standby\)$/));
+    expect(fake.sentBytes).toBe(48 * 100);
+  });
+
+  it("logs the timing of each phase of a job", async () => {
+    const fake = new FakePrinter({ pauseAfterWrites: 3 });
+    const printer = await connected(fake);
+    const logs: string[] = [];
+    printer.on("log", (message) => logs.push(message));
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 90) }, { chunkSize: 96, chunkDelayMs: 0 });
+
+    const stamped = (text: string) => new RegExp(String.raw`^\+\d+\.\d\d s ${text}`);
+    expect(logs[0]).toMatch(/^Printing 90 lines .* 4320 B as 96 B writes every 0 ms$/);
+    expect(logs).toContainEqual(expect.stringMatching(stamped("Printer accepted the job$")));
+    expect(logs).toContainEqual(expect.stringMatching(stamped(String.raw`Flow control: resume after \d+\.\d\d s$`)));
+    expect(logs).toContainEqual(expect.stringMatching(stamped(String.raw`Sent 4320 B in .*a write every .* ms; write calls took`)));
+    expect(logs).toContainEqual(expect.stringMatching(stamped("Printer state: printing$")));
+    expect(logs.at(-1)).toMatch(stamped(String.raw`Print finished \(printer reported standby\)$`));
   });
 
   it("applies per-print transfer pacing", async () => {

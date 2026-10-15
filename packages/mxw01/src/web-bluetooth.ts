@@ -7,6 +7,15 @@ import {
 } from "./constants.js";
 import type { Transport } from "./transport.js";
 
+const PROPERTY_NAMES = [
+  "read",
+  "write",
+  "writeWithoutResponse",
+  "reliableWrite",
+  "notify",
+  "indicate",
+] as const satisfies readonly (keyof BluetoothCharacteristicProperties)[];
+
 /** Transport over the Web Bluetooth API (Chromium browsers, HTTPS or localhost only). */
 export class WebBluetoothTransport implements Transport {
   private control: BluetoothRemoteGATTCharacteristic | null = null;
@@ -43,6 +52,18 @@ export class WebBluetoothTransport implements Transport {
 
   get connected() {
     return this.device.gatt?.connected === true && this.control !== null;
+  }
+
+  /** Which write types the printer offers: tells us whether acknowledged data writes are an option. */
+  get details() {
+    if (!this.control || !this.data || !this.notify) return undefined;
+    const describe = (label: string, characteristic: BluetoothRemoteGATTCharacteristic) =>
+      `${label} [${PROPERTY_NAMES.filter((name) => characteristic.properties[name]).join(", ")}]`;
+    return `GATT: ${[
+      describe("control", this.control),
+      describe("data", this.data),
+      describe("notify", this.notify),
+    ].join(" · ")}`;
   }
 
   async connect() {

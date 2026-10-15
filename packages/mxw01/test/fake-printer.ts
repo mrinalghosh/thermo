@@ -12,6 +12,12 @@ export interface FakePrinterOptions {
   pauseAfterWrites?: number;
   /** With `pauseAfterWrites`: never send the resume marker. */
   neverResume?: boolean;
+  /** Send nothing unprompted after the end-of-data command, like the real MXW01. */
+  quietFlush?: boolean;
+  /** After the end-of-data command, answer this many status requests with "printing". */
+  busyPolls?: number;
+  /** Report "out of paper" to status requests once this many data writes have arrived. */
+  failAfterWrites?: number;
 }
 
 /** In-memory MXW01 that answers like the real printer. */
@@ -22,6 +28,7 @@ export class FakePrinter implements Transport {
   data: Uint8Array[] = [];
   private notifyListeners = new Set<(data: Uint8Array) => void>();
   private disconnectListeners = new Set<() => void>();
+  private busyPollsLeft = 0;
 
   constructor(private options: FakePrinterOptions = {}) {}
 
@@ -46,7 +53,14 @@ export class FakePrinter implements Transport {
     const status = this.options.status ?? [0, 0, 0, 90, 30, 0, 0, 0];
     switch (command) {
       case Command.GetStatus:
-        this.reply(Command.GetStatus, status);
+        if (this.options.failAfterWrites !== undefined && this.data.length >= this.options.failAfterWrites) {
+          this.reply(Command.GetStatus, [1, 0, 0, 90, 30, 0, 1, 1]);
+        } else if (this.busyPollsLeft > 0) {
+          this.busyPollsLeft--;
+          this.reply(Command.GetStatus, [1, ...status.slice(1)]);
+        } else {
+          this.reply(Command.GetStatus, status);
+        }
         break;
       case Command.GetVersion:
         this.reply(Command.GetVersion, [...new TextEncoder().encode(this.options.firmware ?? "1.9.3.1.2")]);
@@ -55,6 +69,8 @@ export class FakePrinter implements Transport {
         this.reply(Command.Print, this.options.printAck ?? [0]);
         break;
       case Command.PrintDataFlush:
+        this.busyPollsLeft = this.options.busyPolls ?? 0;
+        if (this.options.quietFlush) break;
         this.reply(Command.GetStatus, this.options.statusWhilePrinting ?? [1, ...status.slice(1)]);
         setTimeout(() => {
           this.reply(Command.PrintComplete, [0]);

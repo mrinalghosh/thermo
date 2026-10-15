@@ -73,8 +73,11 @@ packet, not the payload.
    app uses 123-byte writes with 4 ms gaps, but that needs a large MTU. On macOS Chrome it
    produced sheared, garbled output, because lost bytes shift every following row
 6. `AD`
-7. Wait until the printer is done: an `A1` reporting standby, or about 3 s without status
-   frames. Disconnecting earlier truncates the print
+7. Wait until the printer is done. Disconnecting earlier truncates the print. Firmware
+   1.9.3.1.2 sends nothing on its own after `AD`: in one 280-line print the last byte went
+   at 5.1 s and the paper stopped at about 11 s, so waiting for 3 s of silence ends too
+   early. Instead, ask for `A1` every ~0.5 s until it has reported printing and then
+   standby, falling back to 3 s without a reply
 
 Jobs shorter than 90 lines are padded to 90. Shorter jobs were reported to misbehave,
 though this is unconfirmed.
@@ -123,6 +126,13 @@ Above about 60 °C the app lowers intensity sharply, and more for dense images. 
 - Which way up does a strip read? jeremy46231's tool rotates jobs 180° by default and
   MaikelChan's doesn't. The web app has a toggle.
 - Is the 90-line minimum real?
+- Does the printer wait for the whole job before it starts? Rough stopwatch timings on
+  firmware 1.9.3.1.2 suggest so, which would make the transfer time a fixed delay before
+  every print.
+- How fast can raster data go? `AE03` offers write-without-response only, and Chrome on
+  macOS returns from each write in under a millisecond, so nothing slows the sender down.
+  One 48-byte row every ~16.7 ms (2.9 kB/s) prints cleanly. Two rows every ~9 ms lost whole
+  writes
 - What scale does the battery byte use?
 - What does `A7` return, and is the serial needed for anything?
 - How should label mode (`01`) behave on continuous paper? The printer has no gap sensor.

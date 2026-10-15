@@ -6,6 +6,8 @@ export interface Transport {
   /** Human-readable device name, if known. */
   readonly name: string | undefined;
   readonly connected: boolean;
+  /** Optional one-line description of the link, logged after connecting. */
+  readonly details?: string;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   /** Write to the control characteristic (0xAE01). */

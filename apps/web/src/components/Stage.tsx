@@ -73,7 +73,10 @@ export function Stage({
             <>
               <div className="btn progress" role="progressbar" aria-valuenow={Math.round(printer.progress! * 100)}>
                 <span className="fill" style={{ width: `${printer.progress! * 100}%` }} />
-                <span className="plabel">printing {Math.round(printer.progress! * 100)}%</span>
+                {/* Progress counts bytes sent; the printer is still at work after the last one. */}
+                <span className="plabel">
+                  {printer.progress! < 1 ? `sending ${Math.floor(printer.progress! * 100)}%` : "printing…"}
+                </span>
               </div>
               <button className="btn ghost" onClick={printer.cancel}>
                 cancel

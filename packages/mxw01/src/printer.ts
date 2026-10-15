@@ -49,6 +49,8 @@ export interface PrinterOptions {
   chunkSize?: number;
   chunkDelayMs?: number;
   responseTimeoutMs?: number;
+  /** How often to ask for status while waiting for a print to finish. Default 500 ms. */
+  statusPollMs?: number;
 }
 
 export interface PrinterInfo {
@@ -88,8 +90,13 @@ interface Waiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
-/** Quiet period after which an in-flight print is assumed finished. */
+/** A printer that stops answering status requests for this long is assumed finished. */
 const COMPLETION_QUIET_MS = 3000;
+/** Stop waiting if the printer still hasn't reported printing this long after the data. */
+const COMPLETION_START_MS = 5000;
+const STATUS_REPLY_TIMEOUT_MS = 1000;
+/** How often to measure a status round trip during the transfer. */
+const PROBE_INTERVAL_MS = 1000;
 const FLOW_RESUME_TIMEOUT_MS = 30_000;
 
 export class MXW01Printer {
@@ -99,6 +106,7 @@ export class MXW01Printer {
   private readonly chunkSize: number;
   private readonly chunkDelayMs: number;
   private readonly responseTimeoutMs: number;
+  private readonly statusPollMs: number;
   private listeners = new Map<keyof Events, Set<(value: never) => void>>();
   private waiters = new Set<Waiter>();
   private unsubscribe: (() => void)[] = [];
@@ -106,6 +114,10 @@ export class MXW01Printer {
   private resumeWaiters: { resolve: () => void; reject: (error: Error) => void }[] = [];
   private busy = false;
   private lastIntensity: number | null = null;
+  // Timing for the activity log, so slow prints can be traced to a phase.
+  private jobStartedAt = 0;
+  private jobState: PrinterStatus["state"] | null = null;
+  private pausedAt: number | null = null;
 
   constructor(
     readonly transport: Transport,
@@ -114,6 +126,7 @@ export class MXW01Printer {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
     this.chunkDelayMs = options.chunkDelayMs ?? DEFAULT_CHUNK_DELAY_MS;
     this.responseTimeoutMs = options.responseTimeoutMs ?? 5000;
+    this.statusPollMs = options.statusPollMs ?? 500;
   }
 
   get connected() {
@@ -136,6 +149,7 @@ export class MXW01Printer {
     for (const off of this.unsubscribe.splice(0)) off();
     // The printer may have been power-cycled since we last talked: resend intensity.
     this.paused = false;
+    this.pausedAt = null;
     this.lastIntensity = null;
     this.unsubscribe.push(
       this.transport.onNotify(this.handleNotification),
@@ -143,11 +157,10 @@ export class MXW01Printer {
     );
     await this.transport.connect();
     this.log(`Connected to ${this.transport.name ?? "printer"}`);
+    if (this.transport.details) this.log(this.transport.details);
     // The vendor app waits briefly, then asks for the firmware version.
     await sleep(200);
-    const version = this.waitFor([Command.GetVersion], 1000, false);
-    await this.transport.writeControl(commands.getVersion());
-    await version;
+    await this.request(commands.getVersion(), Command.GetVersion, 1000, false);
     await this.getStatus().catch((error) => this.log(`Status unavailable: ${error.message}`));
   }
 
@@ -158,9 +171,7 @@ export class MXW01Printer {
   }
 
   async getStatus(): Promise<PrinterStatus> {
-    const reply = this.waitFor([Command.GetStatus], this.responseTimeoutMs);
-    await this.transport.writeControl(commands.getStatus());
-    const packet = await reply;
+    const packet = await this.request(commands.getStatus(), Command.GetStatus, this.responseTimeoutMs);
     const status = packet && parseStatus(packet.payload);
     if (!status) throw new PrinterError("Malformed status response", "timeout");
     return status;
@@ -183,6 +194,8 @@ export class MXW01Printer {
   async print(job: PrintJob, options: PrintOptions = {}) {
     if (this.busy) throw new PrinterError("A print job is already running", "busy");
     this.busy = true;
+    this.jobStartedAt = performance.now();
+    this.jobState = null;
     try {
       await this.runJob(job, options);
     } finally {
@@ -221,49 +234,114 @@ export class MXW01Printer {
     const delay = startDelayMs(heat, intensityChanged);
     if (delay) await sleep(delay);
 
-    this.log(`Printing ${lines} lines (${mode}, intensity 0x${intensity.toString(16)})`);
-    const accepted = this.waitFor([Command.Print], this.responseTimeoutMs);
-    await this.transport.writeControl(commands.printRequest(lines, mode));
-    const ack = await accepted;
+    const chunkSize = options.chunkSize ?? this.chunkSize;
+    const chunkDelayMs = options.chunkDelayMs ?? this.chunkDelayMs;
+    this.log(
+      `Printing ${lines} lines (${mode}, intensity 0x${intensity.toString(16)}) · ` +
+        `${data.length} B as ${chunkSize} B writes every ${chunkDelayMs} ms`,
+    );
+    const ack = await this.request(commands.printRequest(lines, mode), Command.Print, this.responseTimeoutMs);
     // Some firmwares acknowledge with a bare `22 21 A9 00 00 00`, i.e. no status byte.
     if (!ack || (ack.payload[0] ?? 0x00) !== 0x00) {
       throw new PrinterError(`Printer rejected the job (${ack ? toHex(ack.payload) : "no reply"})`, "rejected");
     }
+    this.log(`${this.elapsed()} Printer accepted the job`);
 
-    const chunkSize = options.chunkSize ?? this.chunkSize;
-    const chunkDelayMs = options.chunkDelayMs ?? this.chunkDelayMs;
+    const sendStartedAt = performance.now();
+    let writes = 0;
+    let writeMs = 0;
+    let slowestWriteMs = 0;
+    let probe: Promise<void> | null = null;
+    let nextProbeAt = sendStartedAt + PROBE_INTERVAL_MS;
     for (let offset = 0; offset < data.length; offset += chunkSize) {
       if (this.paused) await this.waitForResume(options.signal);
-      if (options.signal?.aborted) {
-        await this.transport.writeControl(commands.cancel()).catch(() => {});
-        throw new PrinterError("Print cancelled", "aborted");
+      if (options.signal?.aborted) throw await this.cancelJob();
+      // Status replies to the probes below can report a problem mid-transfer.
+      if (this.status && !this.status.ok) {
+        await this.cancelJob();
+        throw new PrinterError(describeError(this.status.error), this.status.error ?? "unknown");
       }
+      const writeStartedAt = performance.now();
       await this.transport.writeData(data.subarray(offset, offset + chunkSize));
+      // A write that returns instantly at any rate means the host applies no backpressure.
+      const took = performance.now() - writeStartedAt;
+      writes++;
+      writeMs += took;
+      slowestWriteMs = Math.max(slowestWriteMs, took);
       options.onProgress?.(Math.min(offset + chunkSize, data.length), data.length);
+      if (!probe && performance.now() >= nextProbeAt) {
+        probe = this.probeStatus().finally(() => {
+          probe = null;
+          nextProbeAt = performance.now() + PROBE_INTERVAL_MS;
+        });
+      }
       if (chunkDelayMs) await sleep(chunkDelayMs);
     }
+    const sendMs = Math.max(performance.now() - sendStartedAt, 0.001);
+    this.log(
+      `${this.elapsed()} Sent ${data.length} B in ${seconds(sendMs)} ` +
+        `(${(data.length / sendMs).toFixed(1)} kB/s, a write every ${(sendMs / writes).toFixed(1)} ms; ` +
+        `write calls took ${(writeMs / writes).toFixed(1)} ms avg, ${slowestWriteMs.toFixed(1)} ms max)`,
+    );
     await this.transport.writeControl(commands.flush());
-    await this.waitForCompletion(lines);
-    this.log("Print finished");
+    const how = await this.waitForCompletion(lines, options.signal);
+    this.log(`${this.elapsed()} Print finished (${how})`);
   }
 
   /**
-   * The printer keeps printing for a while after the last byte arrives and streams A1
-   * status frames meanwhile. Done = it reports standby, or it goes quiet.
+   * The printer keeps printing long after the last byte arrives, and some firmwares send
+   * nothing meanwhile, so ask. Done = it has reported printing and then standby. If it stops
+   * answering, assume it's done once it has been quiet for a while.
    */
-  private async waitForCompletion(lines: number) {
+  private async waitForCompletion(lines: number, signal?: AbortSignal) {
     const deadline = Date.now() + 15_000 + (lines / 10) * 1000;
+    const startedAt = performance.now();
+    let lastReplyAt = startedAt;
+    let started = false;
     while (Date.now() < deadline) {
-      const packet = await this.waitFor([Command.GetStatus, Command.PrintComplete], COMPLETION_QUIET_MS, false);
-      if (!packet) return;
-      if (packet.command !== Command.GetStatus) continue;
-      const status = parseStatus(packet.payload);
-      if (status && !status.ok) {
-        throw new PrinterError(describeError(status.error), status.error ?? "unknown");
+      if (signal?.aborted) throw await this.cancelJob();
+      const packet = await this.request(commands.getStatus(), Command.GetStatus, STATUS_REPLY_TIMEOUT_MS, false);
+      if (signal?.aborted) throw await this.cancelJob();
+      const status = packet && parseStatus(packet.payload);
+      const now = performance.now();
+      if (status) {
+        lastReplyAt = now;
+        if (!status.ok) throw new PrinterError(describeError(status.error), status.error ?? "unknown");
+        if (status.state !== "standby") started = true;
+        else if (started) return "printer reported standby";
+        else if (now - startedAt >= COMPLETION_START_MS) return "printer never reported printing";
+      } else if (now - lastReplyAt >= COMPLETION_QUIET_MS) {
+        return `no status for ${seconds(now - lastReplyAt)}`;
       }
-      if (status?.state === "standby") return;
+      await sleep(this.statusPollMs, signal);
     }
-    this.log("Timed out waiting for the printer to finish");
+    return "timed out waiting for the printer";
+  }
+
+  /** Tells the printer to drop the job; returns the error to throw. */
+  private async cancelJob() {
+    await this.transport.writeControl(commands.cancel()).catch(() => {});
+    return new PrinterError("Print cancelled", "aborted");
+  }
+
+  /**
+   * Asks for status mid-transfer and logs the round trip. The request queues behind the data
+   * already written, so a slow reply means data is backing up on its way to the printer.
+   */
+  private async probeStatus() {
+    const sentAt = performance.now();
+    try {
+      const packet = await this.request(commands.getStatus(), Command.GetStatus, STATUS_REPLY_TIMEOUT_MS, false);
+      if (!this.busy) return; // the job ended (cancelled or failed) while waiting
+      const status = packet && parseStatus(packet.payload);
+      this.log(
+        status
+          ? `${this.elapsed()} Status reply in ${(performance.now() - sentAt).toFixed(0)} ms (${status.state})`
+          : `${this.elapsed()} No status reply within ${seconds(STATUS_REPLY_TIMEOUT_MS)}`,
+      );
+    } catch {
+      // A disconnect or cancel is reported by the transfer itself.
+    }
   }
 
   /** Resolves when the printer resumes or the job is cancelled; rejects on timeout or disconnect. */
@@ -286,6 +364,18 @@ export class MXW01Printer {
       signal?.addEventListener("abort", onAbort);
       this.resumeWaiters.push(waiter);
     });
+  }
+
+  /** Sends a control packet and waits for the reply, listening before sending so a fast reply isn't missed. */
+  private async request(packet: Uint8Array, reply: number, timeoutMs: number, required = true) {
+    const replied = this.waitFor([reply], timeoutMs, required);
+    try {
+      await this.transport.writeControl(packet);
+    } catch (error) {
+      replied.catch(() => {}); // a disconnect may still reject the abandoned waiter
+      throw error;
+    }
+    return replied;
   }
 
   private waitFor(commands: number[], timeoutMs: number, required = true) {
@@ -311,7 +401,14 @@ export class MXW01Printer {
     const flow = flowControlSignal(data);
     if (flow) {
       this.paused = flow === "pause";
-      this.log(`Flow control: ${flow}`);
+      let pausedFor = "";
+      if (this.paused) {
+        this.pausedAt ??= performance.now();
+      } else if (this.pausedAt !== null) {
+        pausedFor = ` after ${seconds(performance.now() - this.pausedAt)}`;
+        this.pausedAt = null;
+      }
+      this.log(`${this.busy ? `${this.elapsed()} ` : ""}Flow control: ${flow}${pausedFor}`);
       if (!this.paused) for (const waiter of [...this.resumeWaiters]) waiter.resolve();
       return;
     }
@@ -322,6 +419,10 @@ export class MXW01Printer {
       return;
     }
     const { command, payload } = packet;
+    // Anything else the printer volunteers during a job may be how it signals progress.
+    if (this.busy && command !== Command.GetStatus && command !== Command.Print) {
+      this.log(`${this.elapsed()} Printer sent 0x${command.toString(16)}: ${toHex(payload) || "(no payload)"}`);
+    }
 
     switch (command) {
       case Command.GetStatus: {
@@ -329,6 +430,13 @@ export class MXW01Printer {
         if (status) {
           this.status = status;
           this.emit("status", status);
+          if (this.busy) {
+            // The first frame of a job is the pre-print check; log changes after that.
+            if (this.jobState !== null && status.state !== this.jobState) {
+              this.log(`${this.elapsed()} Printer state: ${status.state}`);
+            }
+            this.jobState = status.state;
+          }
         }
         break;
       }
@@ -373,6 +481,7 @@ export class MXW01Printer {
 
   private handleDisconnect = () => {
     this.paused = false;
+    this.pausedAt = null;
     this.lastIntensity = null;
     const error = new PrinterError("Printer disconnected", "disconnected");
     this.rejectWaiters(error);
@@ -395,6 +504,11 @@ export class MXW01Printer {
 
   private log(message: string) {
     this.emit("log", message);
+  }
+
+  /** Time since the current job started, e.g. "+1.25 s". */
+  private elapsed() {
+    return `+${seconds(performance.now() - this.jobStartedAt)}`;
   }
 }
 
@@ -419,6 +533,20 @@ function describeError(error: PrinterErrorKind | null) {
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function seconds(ms: number) {
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done);
+  });
 }
