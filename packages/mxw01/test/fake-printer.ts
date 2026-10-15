@@ -10,6 +10,8 @@ export interface FakePrinterOptions {
   firmware?: string;
   /** Send a pause marker after this many data writes, then resume shortly after. */
   pauseAfterWrites?: number;
+  /** With `pauseAfterWrites`: never send the resume marker. */
+  neverResume?: boolean;
 }
 
 /** In-memory MXW01 that answers like the real printer. */
@@ -28,11 +30,17 @@ export class FakePrinter implements Transport {
   }
 
   async disconnect() {
+    this.drop();
+  }
+
+  /** The link drops on its own (out of range, powered off). */
+  drop() {
     this.connected = false;
     for (const listener of this.disconnectListeners) listener();
   }
 
   async writeControl(packet: Uint8Array) {
+    this.assertConnected();
     this.control.push(packet);
     const command = decodePacket(packet)?.command;
     const status = this.options.status ?? [0, 0, 0, 90, 30, 0, 0, 0];
@@ -57,10 +65,14 @@ export class FakePrinter implements Transport {
   }
 
   async writeData(chunk: Uint8Array) {
+    this.assertConnected();
     this.data.push(chunk.slice());
     if (this.data.length === this.options.pauseAfterWrites) {
-      this.emit(Uint8Array.of(0x22, 0x21, 0xae, 0x01, 0x01, 0x00, 0x10, 0x70, 0xff));
-      setTimeout(() => this.emit(Uint8Array.of(0x22, 0x21, 0xae, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff)), 20);
+      // Delivered before the write resolves, so the very next chunk sees the pause.
+      this.deliver(Uint8Array.of(0x22, 0x21, 0xae, 0x01, 0x01, 0x00, 0x10, 0x70, 0xff));
+      if (!this.options.neverResume) {
+        setTimeout(() => this.emit(Uint8Array.of(0x22, 0x21, 0xae, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff)), 20);
+      }
     }
   }
 
@@ -83,9 +95,15 @@ export class FakePrinter implements Transport {
   }
 
   emit(data: Uint8Array) {
-    setTimeout(() => {
-      for (const listener of this.notifyListeners) listener(data);
-    }, 1);
+    setTimeout(() => this.deliver(data), 1);
+  }
+
+  private deliver(data: Uint8Array) {
+    for (const listener of this.notifyListeners) listener(data);
+  }
+
+  private assertConnected() {
+    if (!this.connected) throw new Error("Printer is not connected");
   }
 
   private reply(command: number, payload: number[]) {

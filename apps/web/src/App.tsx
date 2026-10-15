@@ -1,20 +1,22 @@
 import { WebBluetoothTransport } from "@thermo/mxw01";
 import { pack, rasterize, toGray } from "@thermo/render";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { canvasPixels, renderImage, renderTestPattern, renderText, type TextLayout } from "./compose.js";
-import { ConnectionBar } from "./components/ConnectionBar.js";
-import { HoldButton } from "./components/HoldButton.js";
-import { ImageEditor } from "./components/ImageEditor.js";
-import { LogPanel } from "./components/LogPanel.js";
-import { Preview } from "./components/Preview.js";
-import { SettingsPanel } from "./components/SettingsPanel.js";
-import { TextEditor } from "./components/TextEditor.js";
-import { DEFAULT_SETTINGS, SOURCE_LABELS, type SourceKind } from "./settings.js";
+import { Composer } from "./components/Composer.js";
+import { Drawer } from "./components/Drawer.js";
+import { HeaderBar, type DrawerKind } from "./components/HeaderBar.js";
+import { SourceBar } from "./components/SourceBar.js";
+import { Stage } from "./components/Stage.js";
+import { StatusBar } from "./components/StatusBar.js";
+import { DEFAULT_SETTINGS, type SourceKind } from "./settings.js";
 import { usePrinter } from "./usePrinter.js";
 import { useStoredState } from "./useStoredState.js";
 
-/** Paper moved per step while Feed/Retract is held (8 lines = 1 mm). */
-const HOLD_STEP_LINES = 8;
+/**
+ * Longest strip we can handle: the A9 print request counts lines in 16 bits, and Chrome
+ * silently blanks canvases taller than this. About 8 m of paper.
+ */
+const MAX_LINES = 65_535;
 
 const DEFAULT_TEXT: TextLayout = {
   text: "Hello from thermo!",
@@ -30,102 +32,103 @@ export function App() {
   const [textLayout, setTextLayout] = useStoredState("text", DEFAULT_TEXT);
   const [image, setImage] = useState<ImageBitmap | null>(null);
   const [source, setSource] = useState<SourceKind>("text");
-  const transfer = useMemo(
-    () => ({ chunkSize: settings.chunkSize, chunkDelayMs: settings.chunkDelayMs }),
-    [settings.chunkSize, settings.chunkDelayMs],
-  );
-  const printer = usePrinter(transfer);
+  const [drawer, setDrawer] = useState<DrawerKind | null>(null);
+  const printer = usePrinter();
+  // Stored settings from an older version may lack a newer source's entry.
+  const dither = settings.dither[source] ?? DEFAULT_SETTINGS.dither[source];
 
   const canvas = useMemo(() => {
     if (source === "test") return renderTestPattern();
     if (source === "image") return image ? renderImage(image) : null;
     return textLayout.text.trim() ? renderText(textLayout) : null;
   }, [source, image, textLayout]);
+  const tooLong = canvas !== null && canvas.height > MAX_LINES;
 
   // The preview shows the raster upright; rotation is applied only to what is sent.
   const raster = useMemo(
     () =>
-      canvas &&
-      rasterize(toGray(canvasPixels(canvas)), {
-        mode: settings.mode,
-        dither: settings.dither[source],
-        brightness: settings.brightness,
-        contrast: settings.contrast,
-      }),
-    [canvas, source, settings.mode, settings.dither, settings.brightness, settings.contrast],
+      canvas && !tooLong
+        ? rasterize(toGray(canvasPixels(canvas)), {
+            mode: settings.mode,
+            dither,
+            brightness: settings.brightness,
+            contrast: settings.contrast,
+          })
+        : null,
+    [canvas, tooLong, dither, settings.mode, settings.brightness, settings.contrast],
   );
 
-  const handlePrint = () => {
-    if (!raster) return;
+  const handlePrint = useCallback(() => {
+    if (!raster || !printer.connected || printer.progress !== null) return;
     const ink = settings.rotate ? raster.ink.slice().reverse() : raster.ink;
-    void printer.print({ mode: raster.mode, data: pack({ ...raster, ink }) }, { darkness: settings.darkness });
-  };
+    void printer.print(
+      { mode: raster.mode, data: pack({ ...raster, ink }) },
+      { darkness: settings.darkness, chunkSize: settings.chunkSize, chunkDelayMs: settings.chunkDelayMs },
+    );
+  }, [raster, printer, settings.rotate, settings.darkness, settings.chunkSize, settings.chunkDelayMs]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handlePrint();
+      } else if (e.key === "Escape") {
+        setDrawer(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handlePrint]);
+
+  // A file dropped outside the image drop zone would make the browser navigate to it,
+  // throwing away whatever was being composed.
+  useEffect(() => {
+    const block = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", block);
+    window.addEventListener("drop", block);
+    return () => {
+      window.removeEventListener("dragover", block);
+      window.removeEventListener("drop", block);
+    };
+  }, []);
 
   return (
     <div className="app">
-      <ConnectionBar printer={printer} />
+      <HeaderBar printer={printer} drawer={drawer} onToggleDrawer={(kind) => setDrawer((d) => (d === kind ? null : kind))} />
 
       {!WebBluetoothTransport.isSupported() && (
-        <p className="banner">
-          This browser can’t talk to Bluetooth printers. Use Chrome or Edge on desktop or Android (Safari, Firefox and
-          iOS don’t support Web Bluetooth).
-        </p>
+        <div className="notice warn">
+          This browser can’t reach Bluetooth printers. Use Chrome or Edge on desktop or Android. Safari, Firefox and
+          iOS don’t support Web Bluetooth.
+        </div>
       )}
 
-      <main className="layout">
-        <section className="panel">
-          <div className="tabs" role="tablist">
-            {(Object.keys(SOURCE_LABELS) as SourceKind[]).map((kind) => (
-              <button
-                key={kind}
-                role="tab"
-                aria-selected={source === kind}
-                className={source === kind ? "tab active" : "tab"}
-                onClick={() => setSource(kind)}
-              >
-                {SOURCE_LABELS[kind]}
-              </button>
-            ))}
-          </div>
-          {source === "text" && <TextEditor layout={textLayout} onChange={setTextLayout} />}
-          {source === "image" && <ImageEditor image={image} onChange={setImage} />}
-          {source === "test" && (
-            <p className="hint">
-              A calibration strip. The border should be unbroken and the vertical lines straight; if they lean or
-              the print turns to noise partway down, data is being lost in transfer, so try a longer delay or a
-              smaller chunk size under Advanced. Use the edge labels to check orientation.
-            </p>
-          )}
-          <SettingsPanel settings={settings} source={source} onChange={setSettings} />
-        </section>
+      <SourceBar source={source} onChange={setSource} />
 
-        <section className="panel preview-panel">
-          <Preview raster={raster} />
-          <div className="actions">
-            {printer.progress === null ? (
-              <button className="primary" disabled={!printer.connected || !raster} onClick={handlePrint}>
-                Print
-              </button>
-            ) : (
-              <>
-                <progress value={printer.progress} max={1} />
-                <button onClick={printer.cancel}>Cancel</button>
-              </>
-            )}
-          </div>
-          <div className="paper-controls">
-            <span>Paper</span>
-            <HoldButton disabled={!printer.connected || printer.progress !== null} onStep={() => printer.feed(HOLD_STEP_LINES)}>
-              Feed
-            </HoldButton>
-            <HoldButton disabled={!printer.connected || printer.progress !== null} onStep={() => printer.retract(HOLD_STEP_LINES)}>
-              Retract
-            </HoldButton>
-            <span className="hint">hold to move</span>
-          </div>
-          <LogPanel logs={printer.logs} />
-        </section>
+      <main className="main">
+        <Stage
+          raster={raster}
+          notice={tooLong ? "too long to print in one go (max ≈ 8 m). split it up." : undefined}
+          dither={dither}
+          printer={printer}
+          onPrint={handlePrint}
+        />
+        <Composer
+          source={source}
+          textLayout={textLayout}
+          onTextLayout={setTextLayout}
+          image={image}
+          onImage={setImage}
+          settings={settings}
+          onSettings={setSettings}
+        />
       </main>
+
+      <StatusBar last={printer.logs.at(-1)} onOpenLog={() => setDrawer("log")} />
+
+      {drawer && (
+        <Drawer kind={drawer} onClose={() => setDrawer(null)} settings={settings} onSettings={setSettings} printer={printer} />
+      )}
     </div>
   );
 }

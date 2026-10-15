@@ -94,8 +94,61 @@ describe("MXW01Printer", () => {
   it("waits while the printer asks to pause the data stream", async () => {
     const fake = new FakePrinter({ pauseAfterWrites: 3 });
     const printer = await connected(fake);
-    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) });
+    const sentWhenResumed: number[] = [];
+    // The fake resumes 20 ms after pausing; nothing more may be sent in between.
+    const result = printer.print(
+      { mode: "1bpp", data: new Uint8Array(48 * 100) },
+      { onProgress: (sent) => sent === 48 * 3 && setTimeout(() => sentWhenResumed.push(fake.sentBytes), 10) },
+    );
+    await result;
+    expect(sentWhenResumed).toEqual([48 * 3]);
     expect(fake.sentBytes).toBe(48 * 100);
+  });
+
+  it("applies per-print transfer pacing", async () => {
+    const fake = new FakePrinter();
+    const printer = await connected(fake);
+    await printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) }, { chunkSize: 24, chunkDelayMs: 0 });
+    expect(fake.data.every((chunk) => chunk.length === 24)).toBe(true);
+  });
+
+  // Both act 20 ms after the printer pauses the stream, while the driver is waiting on it.
+  const atPause = (action: () => void) => (sent: number) => sent === 48 * 3 && setTimeout(action, 20);
+
+  it("cancels promptly while the printer has paused the stream", async () => {
+    const fake = new FakePrinter({ pauseAfterWrites: 3, neverResume: true });
+    const printer = await connected(fake);
+    const controller = new AbortController();
+    const started = Date.now();
+    const result = printer.print(
+      { mode: "1bpp", data: new Uint8Array(48 * 100) },
+      { signal: controller.signal, onProgress: atPause(() => controller.abort()) },
+    );
+    await expect(result).rejects.toMatchObject({ reason: "aborted" });
+    expect(fake.sentBytes).toBe(48 * 3);
+    expect(fake.sentCommands).toContain(Command.CancelPrint);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("fails promptly if the printer disconnects while paused", async () => {
+    const fake = new FakePrinter({ pauseAfterWrites: 3, neverResume: true });
+    const printer = await connected(fake);
+    const started = Date.now();
+    const result = printer.print({ mode: "1bpp", data: new Uint8Array(48 * 100) }, { onProgress: atPause(() => fake.drop()) });
+    await expect(result).rejects.toMatchObject({ reason: "disconnected" });
+    expect(fake.sentBytes).toBe(48 * 3);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("resends intensity after reconnecting", async () => {
+    const fake = new FakePrinter();
+    const printer = await connected(fake);
+    const job = { mode: "1bpp" as const, data: new Uint8Array(48 * 90) };
+    await printer.print(job, { darkness: 3 });
+    await printer.disconnect();
+    await printer.connect();
+    await printer.print(job, { darkness: 3 });
+    expect(fake.sentCommands.filter((c) => c === Command.SetIntensity)).toHaveLength(2);
   });
 
   it("cancels when aborted", async () => {

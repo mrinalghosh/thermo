@@ -14,14 +14,9 @@ export interface LogEntry {
   error?: boolean;
 }
 
-export interface TransferSettings {
-  chunkSize: number;
-  chunkDelayMs: number;
-}
-
 const STATUS_POLL_MS = 30_000;
 
-export function usePrinter(transfer: TransferSettings) {
+export function usePrinter() {
   const printerRef = useRef<MXW01Printer | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const [connected, setConnected] = useState(false);
@@ -38,12 +33,24 @@ export function usePrinter(transfer: TransferSettings) {
   const fail = useCallback((error: unknown) => log((error as Error).message ?? String(error), true), [log]);
 
   const connect = useCallback(async () => {
+    if (!WebBluetoothTransport.isSupported()) {
+      log("This browser doesn’t support Web Bluetooth. Use Chrome or Edge on desktop or Android.", true);
+      return;
+    }
     setConnecting(true);
+    let printer = printerRef.current;
+    const chosenNow = !printer;
     try {
-      let printer = printerRef.current;
       if (!printer) {
-        const transport = await WebBluetoothTransport.request();
-        printer = new MXW01Printer(transport, transfer);
+        let transport: WebBluetoothTransport;
+        try {
+          transport = await WebBluetoothTransport.request();
+        } catch (error) {
+          // Closing the device chooser is not an error worth reporting.
+          if ((error as Error).name !== "NotFoundError") fail(error);
+          return;
+        }
+        printer = new MXW01Printer(transport);
         printer.on("status", setStatus);
         printer.on("info", setInfo);
         printer.on("log", (message) => log(message));
@@ -53,12 +60,19 @@ export function usePrinter(transfer: TransferSettings) {
       await printer.connect();
       setConnected(true);
     } catch (error) {
-      // Closing the device chooser is not an error worth reporting.
-      if ((error as Error).name !== "NotFoundError") fail(error);
+      fail(error);
+      // A device that never connected (wrong model, out of range) shouldn't stick as
+      // "reconnect"; the next click opens the chooser again.
+      if (chosenNow && printerRef.current === printer) {
+        await printer?.disconnect().catch(() => {});
+        printerRef.current = null;
+        setInfo(null);
+        setStatus(null);
+      }
     } finally {
       setConnecting(false);
     }
-  }, [transfer, log, fail]);
+  }, [log, fail]);
 
   const disconnect = useCallback(async () => {
     await printerRef.current?.disconnect().catch(fail);

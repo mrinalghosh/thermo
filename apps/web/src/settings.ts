@@ -27,14 +27,22 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 export const SOURCE_LABELS: Record<SourceKind, string> = {
-  text: "Text",
-  image: "Image",
-  test: "Test pattern",
+  text: "text",
+  image: "image",
+  test: "test pattern",
 };
 
+/** Short labels for the segmented control. */
 export const DITHER_LABELS: Record<DitherMethod, string> = {
-  "floyd-steinberg": "Floyd–Steinberg",
-  atkinson: "Atkinson",
-  bayer: "Ordered (Bayer)",
-  threshold: "None (threshold)",
+  "floyd-steinberg": "floyd",
+  atkinson: "atkinson",
+  bayer: "bayer",
+  threshold: "none",
+};
+
+export const DITHER_NAMES: Record<DitherMethod, string> = {
+  "floyd-steinberg": "floyd–steinberg",
+  atkinson: "atkinson",
+  bayer: "ordered (bayer)",
+  threshold: "threshold",
 };

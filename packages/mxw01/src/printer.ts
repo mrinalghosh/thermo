@@ -40,6 +40,9 @@ export interface PrintOptions {
   heatProtection?: boolean;
   signal?: AbortSignal;
   onProgress?: (sentBytes: number, totalBytes: number) => void;
+  /** Override the printer's default transfer pacing for this job. */
+  chunkSize?: number;
+  chunkDelayMs?: number;
 }
 
 export interface PrinterOptions {
@@ -100,7 +103,7 @@ export class MXW01Printer {
   private waiters = new Set<Waiter>();
   private unsubscribe: (() => void)[] = [];
   private paused = false;
-  private resumeWaiters: (() => void)[] = [];
+  private resumeWaiters: { resolve: () => void; reject: (error: Error) => void }[] = [];
   private busy = false;
   private lastIntensity: number | null = null;
 
@@ -131,6 +134,9 @@ export class MXW01Printer {
   /** Safe to call again after a disconnect to reconnect the same device. */
   async connect() {
     for (const off of this.unsubscribe.splice(0)) off();
+    // The printer may have been power-cycled since we last talked: resend intensity.
+    this.paused = false;
+    this.lastIntensity = null;
     this.unsubscribe.push(
       this.transport.onNotify(this.handleNotification),
       this.transport.onDisconnect(this.handleDisconnect),
@@ -224,15 +230,17 @@ export class MXW01Printer {
       throw new PrinterError(`Printer rejected the job (${ack ? toHex(ack.payload) : "no reply"})`, "rejected");
     }
 
-    for (let offset = 0; offset < data.length; offset += this.chunkSize) {
+    const chunkSize = options.chunkSize ?? this.chunkSize;
+    const chunkDelayMs = options.chunkDelayMs ?? this.chunkDelayMs;
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      if (this.paused) await this.waitForResume(options.signal);
       if (options.signal?.aborted) {
         await this.transport.writeControl(commands.cancel()).catch(() => {});
         throw new PrinterError("Print cancelled", "aborted");
       }
-      if (this.paused) await this.waitForResume();
-      await this.transport.writeData(data.subarray(offset, offset + this.chunkSize));
-      options.onProgress?.(Math.min(offset + this.chunkSize, data.length), data.length);
-      if (this.chunkDelayMs) await sleep(this.chunkDelayMs);
+      await this.transport.writeData(data.subarray(offset, offset + chunkSize));
+      options.onProgress?.(Math.min(offset + chunkSize, data.length), data.length);
+      if (chunkDelayMs) await sleep(chunkDelayMs);
     }
     await this.transport.writeControl(commands.flush());
     await this.waitForCompletion(lines);
@@ -258,16 +266,25 @@ export class MXW01Printer {
     this.log("Timed out waiting for the printer to finish");
   }
 
-  private waitForResume() {
+  /** Resolves when the printer resumes or the job is cancelled; rejects on timeout or disconnect. */
+  private waitForResume(signal?: AbortSignal) {
     return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return resolve();
+      const settle = (error?: Error) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        this.resumeWaiters = this.resumeWaiters.filter((w) => w !== waiter);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onAbort = () => settle();
+      const waiter = { resolve: () => settle(), reject: (error: Error) => settle(error) };
       const timer = setTimeout(
-        () => reject(new PrinterError("Printer did not resume after pausing", "timeout")),
+        () => settle(new PrinterError("Printer did not resume after pausing", "timeout")),
         FLOW_RESUME_TIMEOUT_MS,
       );
-      this.resumeWaiters.push(() => {
-        clearTimeout(timer);
-        resolve();
-      });
+      signal?.addEventListener("abort", onAbort);
+      this.resumeWaiters.push(waiter);
     });
   }
 
@@ -295,7 +312,7 @@ export class MXW01Printer {
     if (flow) {
       this.paused = flow === "pause";
       this.log(`Flow control: ${flow}`);
-      if (!this.paused) for (const resume of this.resumeWaiters.splice(0)) resume();
+      if (!this.paused) for (const waiter of [...this.resumeWaiters]) waiter.resolve();
       return;
     }
 
@@ -357,7 +374,9 @@ export class MXW01Printer {
   private handleDisconnect = () => {
     this.paused = false;
     this.lastIntensity = null;
-    this.rejectWaiters(new PrinterError("Printer disconnected", "disconnected"));
+    const error = new PrinterError("Printer disconnected", "disconnected");
+    this.rejectWaiters(error);
+    for (const waiter of [...this.resumeWaiters]) waiter.reject(error);
     this.log("Disconnected");
     this.emit("disconnect", undefined);
   };

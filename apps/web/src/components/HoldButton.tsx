@@ -11,10 +11,12 @@ const REPEAT_MS = 120;
 export function HoldButton({
   onStep,
   disabled,
+  className,
   children,
 }: {
   onStep: () => Promise<unknown>;
   disabled?: boolean;
+  className?: string;
   children: ReactNode;
 }) {
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -61,7 +63,8 @@ export function HoldButton({
   return (
     <button
       type="button"
-      className="hold"
+      className={className ? `${className} hold` : "hold"}
+      title="hold to move paper"
       disabled={disabled}
       onPointerDown={(e) => e.button === 0 && start()}
       onPointerUp={stop}

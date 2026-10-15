@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Field } from "./ui.js";
 
 export function ImageEditor({
   image,
@@ -16,7 +17,7 @@ export function ImageEditor({
       onChange(await createImageBitmap(file));
       setError(null);
     } catch {
-      setError(`Couldn’t read ${file.name} as an image`);
+      setError(`couldn’t read ${file.name} as an image`);
     }
   };
 
@@ -31,7 +32,7 @@ export function ImageEditor({
   });
 
   return (
-    <div className="editor">
+    <Field label="image" hint={image ? `${image.width} × ${image.height} px` : undefined}>
       <label
         className={dragging ? "dropzone dragging" : "dropzone"}
         onDragOver={(e) => {
@@ -46,14 +47,14 @@ export function ImageEditor({
         }}
       >
         <input type="file" accept="image/*" onChange={(e) => void load(e.target.files?.[0])} hidden />
-        {image ? `${image.width} × ${image.height} image loaded. Drop or paste to replace.` : "Drop, paste or click to choose an image"}
+        {image ? "drop, paste or click to replace" : "drop, paste or click to choose an image"}
       </label>
-      {error && <p className="error-text">{error}</p>}
+      {error && <p className="warn">{error}</p>}
       {image && (
-        <button className="link" onClick={() => onChange(null)}>
-          Remove image
+        <button className="preset" onClick={() => onChange(null)}>
+          remove image
         </button>
       )}
-    </div>
+    </Field>
   );
 }

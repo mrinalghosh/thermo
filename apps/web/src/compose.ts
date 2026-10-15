@@ -112,8 +112,9 @@ export function renderTestPattern(): HTMLCanvasElement {
   ctx.stroke();
 
   // Gradient for dithering and grayscale.
-  for (let x = 0; x < w; x++) {
-    const v = Math.round((x / (w - 1)) * 255);
+  // Inside the border, so the border stays continuous.
+  for (let x = 2; x < w - 2; x++) {
+    const v = Math.round(((x - 2) / (w - 5)) * 255);
     ctx.fillStyle = `rgb(${v},${v},${v})`;
     ctx.fillRect(x, 188, 1, 36);
   }
